@@ -32,3 +32,32 @@ This package uses optional backends when installed:
 ```bash
 python -m unittest -q
 ```
+
+
+## Development
+
+Install with developer tooling:
+```bash
+pip install -e ".[dev]"
+```
+
+Run lint + type checks:
+```bash
+ruff check .
+mypy src/pywwwget
+```
+
+Run tests:
+```bash
+pytest -q
+python -m unittest -q
+```
+
+## GitHub Actions CI
+
+This repo includes a workflow at `.github/workflows/ci.yml` that runs:
+- ruff (sanity checks)
+- mypy (typed surface)
+- pytest + unittest
+
+on Python 3.9–3.12.

@@ -4,10 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pywwwget-py3"
-version = "0.1.0"
+version = "0.1.1"
 description = "Multi-protocol get/put module (Python 3 only) with HTTP serve/receive and custom tcp/udp streaming."
 readme = "README.md"
 requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [{name = "PyWWWGet contributors"}]
 classifiers = [
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3 :: Only",
@@ -20,12 +22,48 @@ httpx = ["httpx>=0.24"]
 requests = ["requests>=2.28"]
 pycurl = ["pycurl>=7.45"]
 sftp = ["paramiko>=2.12", "pysftp>=0.2.9"]
+all = [
+  "httpx>=0.24",
+  "requests>=2.28",
+  "pycurl>=7.45",
+  "paramiko>=2.12",
+  "pysftp>=0.2.9",
+]
+dev = [
+  "pytest>=7.0",
+  "pytest-cov>=4.0",
+  "ruff>=0.4",
+  "mypy>=1.8",
+  "types-requests>=2.31.0.0",
+]
 
 [project.scripts]
 wwwget = "pywwwget.cli:main"
 
 [tool.setuptools]
-package-dir = {"": "src"}
+package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+target-version = "py39"
+line-length = 100
+
+[tool.ruff.lint]
+# Ruff is configured as a fast parse/sanity check for this large legacy-style module.
+select = []
+
+[tool.mypy]
+python_version = "3.9"
+ignore_missing_imports = true
+warn_unused_ignores = false
+no_implicit_optional = true
+check_untyped_defs = false
+follow_imports = "skip"
+# Type-check the CLI surface; treat imported legacy modules as Any.
+files = ["src/pywwwget/cli.py"]
