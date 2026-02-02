@@ -15,6 +15,7 @@ class TestPyWWWGet(unittest.TestCase):
         self.assertTrue(hasattr(wwwget, "data_url_decode"))
         self.assertTrue(hasattr(wwwget, "_parse_net_url"))
         self.assertTrue(hasattr(wwwget, "_parse_kv_headers"))
+        self.assertTrue(hasattr(wwwget, "_split_bt_netloc"))
 
     def test_data_url_roundtrip(self):
         payload = b"hello world\n\x00\x01\x02"
@@ -48,6 +49,30 @@ class TestPyWWWGet(unittest.TestCase):
         self.assertEqual(parts.scheme, "udp")
         # UDP default mode is "seq" in this module
         self.assertEqual(opts.get("mode"), "seq")
+
+
+    def test_bt_netloc_parsing(self):
+        addr, ch = wwwget._split_bt_netloc("AA:BB:CC:DD:EE:FF:3")
+        self.assertEqual(addr, "AA:BB:CC:DD:EE:FF")
+        self.assertEqual(ch, 3)
+
+        addr, ch = wwwget._split_bt_netloc("AA-BB-CC-DD-EE-FF:7")
+        self.assertEqual(addr, "AA:BB:CC:DD:EE:FF")
+        self.assertEqual(ch, 7)
+
+        addr, ch = wwwget._split_bt_netloc("")
+        self.assertEqual(addr, "00:00:00:00:00:00")
+        self.assertIsNone(ch)
+
+        # Full URL parsing should not rely on urlparse hostname/port for bt
+        from urllib.parse import urlparse, parse_qs
+        parts = urlparse("bt://AA:BB:CC:DD:EE:FF:5/file.bin?channel=6")
+        qs = parse_qs(parts.query or "")
+        host, ch = wwwget._bt_host_channel_from_url(parts, qs, {"bind": None})
+        self.assertEqual(host, "AA:BB:CC:DD:EE:FF")
+        # netloc channel takes precedence over query channel
+        self.assertEqual(ch, 5)
+
 
     def test_local_http_download(self):
         body = b"abc123"

@@ -8,6 +8,10 @@ Examples:
       python wwwget_cli.py get https://example.com/file.bin > file.bin
   - Send a file/dir using a URL scheme supported by the module:
       python wwwget_cli.py put ./mydir tcp://0.0.0.0:9000/?print_url=1
+  - Receive over Bluetooth RFCOMM (listener) and print a shareable URL:
+      python wwwget_cli.py get "bt://00:00:00:00:00:00:3/out.bin?print_url=1" -o out.bin
+    Then, from another device (sender), connect and upload:
+      python wwwget_cli.py put ./in.bin "bt://AA:BB:CC:DD:EE:FF:3/out.bin"
 """
 
 from __future__ import annotations

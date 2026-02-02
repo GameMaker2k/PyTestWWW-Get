@@ -20,4 +20,7 @@ from .core import (  # noqa: F401
     data_url_decode,
     _parse_net_url,
     _parse_kv_headers,
+    _split_bt_netloc,
+    _bt_host_channel_from_url,
+    _BT_SCHEMES,
 )

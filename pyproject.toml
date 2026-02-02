@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pywwwget-py3"
-version = "0.1.1"
+version = "0.1.2"
 description = "Multi-protocol get/put module (Python 3 only) with HTTP serve/receive and custom tcp/udp streaming."
 readme = "README.md"
 requires-python = ">=3.9"

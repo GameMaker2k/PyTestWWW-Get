@@ -11,6 +11,13 @@ import getpass
 import random
 import platform
 import socket
+
+# Optional Bluetooth RFCOMM support: works via stdlib on Linux (AF_BLUETOOTH/BTPROTO_RFCOMM)
+# and via PyBluez if installed.
+try:
+    import bluetooth as _pybluez  # type: ignore
+except Exception:
+    _pybluez = None
 import shutil
 import time
 import struct
@@ -228,7 +235,10 @@ def data_url_decode(data_url):
         if isinstance(decoded_bytes, text_type):
             decoded_bytes = decoded_bytes.encode('latin-1')
 
-    return MkTempFile(decoded_bytes), mime, is_base64
+    if mime is None:
+        mime = "text/plain;charset=US-ASCII"
+    is_text = str(mime).lower().startswith("text/")
+    return MkTempFile(decoded_bytes), mime, is_text
 
 
 from urllib.parse import urlparse, urlunparse, parse_qs, unquote
@@ -3023,30 +3033,194 @@ def _parse_net_url(url):
         "raw_sha": raw_sha,
         "raw_hash": raw_hash,
     }
+# --- Bluetooth RFCOMM helpers -------------------------------------------------
+# Notes:
+# - URLs use the "bt", "rfcomm", or "bluetooth" schemes.
+# - Netloc parsing cannot rely on urlparse.hostname because MAC addresses contain ':'.
+# - Receiver/listener uses recv_to_fileobj(..., proto="bt") which binds and listens on RFCOMM.
+# - Sender uses send_from_fileobj(..., proto="bt") which connects to the receiver.
+
+_BT_SCHEMES = ("bt", "rfcomm", "bluetooth")
+
+def _has_rfcomm() -> bool:
+    """Return True if we can create an RFCOMM stream socket (native or PyBluez)."""
+    try:
+        if hasattr(socket, "AF_BLUETOOTH") and hasattr(socket, "BTPROTO_RFCOMM"):
+            return True
+    except Exception:
+        pass
+    try:
+        if _pybluez is not None and hasattr(_pybluez, "BluetoothSocket") and hasattr(_pybluez, "RFCOMM"):
+            return True
+    except Exception:
+        pass
+    return False
+
+def _bt_socket_stream():
+    """Create an RFCOMM stream socket using stdlib (BlueZ) or PyBluez fallback."""
+    try:
+        if hasattr(socket, "AF_BLUETOOTH") and hasattr(socket, "BTPROTO_RFCOMM"):
+            return socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM)
+    except Exception:
+        pass
+    try:
+        if _pybluez is not None:
+            return _pybluez.BluetoothSocket(_pybluez.RFCOMM)
+    except Exception:
+        pass
+    return None
+
+def _norm_bt_addr(addr: Optional[str]) -> str:
+    """Normalize Bluetooth addresses (AA:BB:.. or AA-BB-..) and accept any/empty markers."""
+    if not addr:
+        return "00:00:00:00:00:00"  # BDADDR_ANY
+    a = str(addr).strip()
+    if a.lower() in ("any", "bdaddr_any", "00:00:00:00:00:00"):
+        return "00:00:00:00:00:00"
+    return a.replace("-", ":")
+
+def _bt_bind_addr(addr: Optional[str]) -> str:
+    """Map our BDADDR_ANY marker to what the underlying stack expects."""
+    a = _norm_bt_addr(addr)
+    # For stdlib BlueZ, BDADDR_ANY is "00:.."; for PyBluez, empty string is typical.
+    if a == "00:00:00:00:00:00" and _pybluez is not None and not (
+        hasattr(socket, "AF_BLUETOOTH") and hasattr(socket, "BTPROTO_RFCOMM")
+    ):
+        return ""
+    return a
+
+def _split_bt_netloc(netloc: str) -> Tuple[str, Optional[int]]:
+    """Parse bt scheme netloc safely without urlparse hostname/port (MAC contains ':').
+
+    Supported:
+      - "AA:BB:CC:DD:EE:FF:3"  -> (AA:..:FF, 3)
+      - "AA-BB-CC-DD-EE-FF:3"  -> (AA:..:FF, 3)
+      - "AA:BB:CC:DD:EE:FF"    -> (AA:..:FF, None)
+      - ""                     -> (BDADDR_ANY, None)
+    """
+    if not netloc:
+        return ("00:00:00:00:00:00", None)
+    s = str(netloc).strip()
+    if "@" in s:
+        # strip any accidental userinfo "x@y"
+        s = s.split("@", 1)[1]
+    s = s.replace("-", ":")
+    parts = s.split(":")
+    ch: Optional[int] = None
+    if len(parts) >= 7 and parts[-1].isdigit():
+        try:
+            ch = int(parts[-1], 10)
+        except Exception:
+            ch = None
+        addr = ":".join(parts[:-1])
+        return (_norm_bt_addr(addr), ch)
+    return (_norm_bt_addr(s), None)
+
+def _bt_host_channel_from_url(parts, qs: Mapping[str, List[str]], o: Mapping[str, Any]) -> Tuple[str, int]:
+    """Resolve bdaddr+channel from urlparse parts and query/bind options."""
+    addr, ch = _split_bt_netloc(getattr(parts, "netloc", "") or "")
+    bind = o.get("bind") or _qstr(qs, "bind", None)
+    if bind:
+        addr = _norm_bt_addr(bind)
+    qch = _qnum(qs, "channel", None, cast=int)
+    if qch is None:
+        qch = _qnum(qs, "rfcomm_channel", None, cast=int)
+    if ch is None and qch is not None:
+        ch = int(qch)
+    if ch is None or int(ch) <= 0:
+        ch = 1
+    return addr, int(ch)
+
 
 def recv_to_fileobj(fileobj, host, port, proto="tcp", path_text=None, **kwargs):
     proto = (proto or "tcp").lower()
     port = int(port)
+    logger = _logger_from_kwargs(kwargs)
 
-    if proto == "tcp":
-        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        except Exception:
-            pass
-        srv.bind((host or "", port))
-        srv.listen(1)
+    if proto == "tcp" or proto in _BT_SCHEMES:
+        is_bt = proto in _BT_SCHEMES
 
-        chosen_port = srv.getsockname()[1]
-        if kwargs.get("print_url"):
-            path = path_text or "/"
-            bind_host = host or "0.0.0.0"
-            for u in _listen_urls("tcp", bind_host, chosen_port, path, ""):
-                _emit("Listening: %s" % u, logger=logger, level=logging.INFO, stream="stdout")
+        if is_bt:
+            if not _has_rfcomm():
+                _emit("Bluetooth RFCOMM is not available (missing AF_BLUETOOTH/BTPROTO_RFCOMM or PyBluez).",
+                      logger=logger, level=logging.ERROR, stream="stderr")
+                return False
+            srv = _bt_socket_stream()
+            if srv is None:
+                _emit("Failed to create Bluetooth RFCOMM socket.", logger=logger, level=logging.ERROR, stream="stderr")
+                return False
             try:
-                sys.stdout.flush()
+                srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             except Exception:
                 pass
+
+            bind_addr = _bt_bind_addr(host or "")
+            ch = int(port) if int(port) > 0 else 1
+            try:
+                srv.bind((bind_addr, ch))
+            except Exception:
+                try:
+                    srv.close()
+                except Exception:
+                    pass
+                return False
+            try:
+                srv.listen(1)
+            except Exception:
+                try:
+                    srv.close()
+                except Exception:
+                    pass
+                return False
+
+            chosen_port = ch
+            try:
+                sn = srv.getsockname()
+                if isinstance(sn, tuple) and len(sn) >= 2:
+                    chosen_port = int(sn[1])
+            except Exception:
+                pass
+
+            if kwargs.get("print_url"):
+                path = path_text or "/"
+                if not path.startswith("/"):
+                    path = "/" + path
+                bind_host = _norm_bt_addr(host or "00:00:00:00:00:00")
+                # If binding to ANY and PyBluez can read local addr, print something more useful.
+                if bind_host == "00:00:00:00:00:00":
+                    try:
+                        if _pybluez is not None and hasattr(_pybluez, "read_local_bdaddr"):
+                            addrs = _pybluez.read_local_bdaddr()
+                            if addrs:
+                                bind_host = _norm_bt_addr(addrs[0])
+                    except Exception:
+                        pass
+                _emit(f"Listening: bt://{bind_host}:{int(chosen_port)}{path}",
+                      logger=logger, level=logging.INFO, stream="stdout")
+                try:
+                    sys.stdout.flush()
+                except Exception:
+                    pass
+
+        else:
+            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            except Exception:
+                pass
+            srv.bind((host or "", port))
+            srv.listen(1)
+
+            chosen_port = srv.getsockname()[1]
+            if kwargs.get("print_url"):
+                path = path_text or "/"
+                bind_host = host or "0.0.0.0"
+                for u in _listen_urls("tcp", bind_host, chosen_port, path, ""):
+                    _emit("Listening: %s" % u, logger=logger, level=logging.INFO, stream="stdout")
+                try:
+                    sys.stdout.flush()
+                except Exception:
+                    pass
 
         idle_to = kwargs.get("idle_timeout", None)
         acc_to = kwargs.get("accept_timeout", None)
@@ -3063,6 +3237,7 @@ def recv_to_fileobj(fileobj, host, port, proto="tcp", path_text=None, **kwargs):
         except Exception:
             pass
 
+        conn = None
         try:
             conn, _addr = srv.accept()
         except socket.timeout:
@@ -3083,15 +3258,59 @@ def recv_to_fileobj(fileobj, host, port, proto="tcp", path_text=None, **kwargs):
             except Exception:
                 pass
             return False
-        if kwargs.get("handshake", True):
+
+        ok = False
+        try:
+            if kwargs.get("handshake", True):
+                try:
+                    conn.settimeout(0.25)
+                    if hasattr(socket, "MSG_PEEK"):
+                        peekh = conn.recv(6, socket.MSG_PEEK)
+                    else:
+                        peekh = b""
+                except Exception:
+                    peekh = b""
+                try:
+                    if to is not None and float(to) > 0:
+                        conn.settimeout(float(to))
+                    else:
+                        conn.settimeout(None)
+                except Exception:
+                    pass
+                if peekh == b"HELLO ":
+                    line = b""
+                    while True:
+                        b = conn.recv(1)
+                        if not b:
+                            break
+                        line += b
+                        if line.endswith(b"\n") or len(line) > 4096:
+                            break
+                    tok = b""
+                    try:
+                        parts2 = line.strip().split(None, 1)
+                        if len(parts2) == 2:
+                            tok = parts2[1]
+                    except Exception:
+                        tok = b""
+                    try:
+                        conn.sendall(b"READY " + tok + b"\n")
+                    except Exception:
+                        pass
+
+            try:
+                if to is not None and float(to) > 0:
+                    conn.settimeout(float(to))
+            except Exception:
+                pass
             try:
                 conn.settimeout(0.25)
                 if hasattr(socket, "MSG_PEEK"):
-                    peekh = conn.recv(6, socket.MSG_PEEK)
+                    peek = conn.recv(5, socket.MSG_PEEK)
                 else:
-                    peekh = b""
+                    peek = b""
             except Exception:
-                peekh = b""
+                peek = b""
             try:
                 if to is not None and float(to) > 0:
                     conn.settimeout(float(to))
@@ -3099,7 +3318,8 @@ def recv_to_fileobj(fileobj, host, port, proto="tcp", path_text=None, **kwargs):
                     conn.settimeout(None)
             except Exception:
                 pass
-            if peekh == b"HELLO ":
+
+            if peek == b"PATH ":
                 line = b""
                 while True:
                     b = conn.recv(1)
@@ -3108,212 +3328,127 @@ def recv_to_fileobj(fileobj, host, port, proto="tcp", path_text=None, **kwargs):
                     line += b
                     if line.endswith(b"\n") or len(line) > 4096:
                         break
-                tok = b""
+
+            # Resume handshake: receiver tells sender where to start
+            if kwargs.get("resume"):
                 try:
-                    parts = line.strip().split(None, 1)
-                    if len(parts) == 2:
-                        tok = parts[1]
+                    cur = fileobj.tell()
                 except Exception:
-                    tok = b""
+                    cur = 0
+                msg = ("OFFSET %d\n" % int(cur)).encode("utf-8")
                 try:
-                    conn.sendall(b"READY " + tok + b"\n")
+                    conn.sendall(msg)
                 except Exception:
                     pass
 
-        try:
-            if to is not None and float(to) > 0:
-                conn.settimeout(float(to))
-        except Exception:
-            pass
-        try:
-            conn.settimeout(0.25)
-            if hasattr(socket, "MSG_PEEK"):
-                peek = conn.recv(5, socket.MSG_PEEK)
+            framing = (kwargs.get("framing") or "").lower()
+            want_sha = bool(kwargs.get("sha256") or kwargs.get("sha") or kwargs.get("want_sha"))
+            h = hashlib.sha256() if want_sha else None
+
+            if framing == "len":
+                try:
+                    header = b""
+                    while len(header) < 16:
+                        chunk = conn.recv(16 - len(header))
+                        if not chunk:
+                            break
+                        header += _to_bytes(chunk)
+                    if len(header) != 16 or not header.startswith(b"PWG4"):
+                        ok = False
+                    else:
+                        size = struct.unpack("!Q", header[4:12])[0]
+                        flags = struct.unpack("!I", header[12:16])[0]
+                        sha_in_stream = bool(flags & 1)
+                        remaining = int(size)
+
+                        while remaining > 0:
+                            chunk = conn.recv(min(65536, remaining))
+                            if not chunk:
+                                break
+                            chunk = _to_bytes(chunk)
+                            fileobj.write(chunk)
+                            if h is not None:
+                                h.update(chunk)
+                            remaining -= len(chunk)
+
+                        if remaining != 0:
+                            ok = False
+                        else:
+                            if sha_in_stream:
+                                digest = b""
+                                while len(digest) < 32:
+                                    part = conn.recv(32 - len(digest))
+                                    if not part:
+                                        break
+                                    digest += _to_bytes(part)
+                                if len(digest) != 32:
+                                    ok = False
+                                elif h is not None and h.digest() != digest:
+                                    ok = False
+                                else:
+                                    ok = True
+                            else:
+                                ok = (not want_sha)
+                except Exception:
+                    ok = False
             else:
-                peek = b""
-        except Exception:
-            peek = b""
-        try:
-            if to is not None and float(to) > 0:
-                conn.settimeout(float(to))
-            else:
-                conn.settimeout(None)
-        except Exception:
-            pass
+                # DONE token mode (unsafe for binary unless token unlikely) OR plain FIN
+                done = bool(kwargs.get("done"))
+                tok = kwargs.get("done_token") or "\nDONE\n"
+                tokb = _to_bytes(tok)
+                tlen = len(tokb)
+                tail = b""
 
-        if peek == b"PATH ":
-            line = b""
-            while True:
-                b = conn.recv(1)
-                if not b:
-                    break
-                line += b
-                if line.endswith(b"\n") or len(line) > 4096:
-                    break
-
-        # Resume handshake: receiver tells sender where to start
-        if kwargs.get("resume"):
-            try:
-                cur = fileobj.tell()
-            except Exception:
-                cur = 0
-            msg = ("OFFSET %d\n" % int(cur)).encode("utf-8")
-            try:
-                conn.sendall(msg)
-            except Exception:
-                pass
-
-        framing = (kwargs.get("framing") or "").lower()
-        want_sha = bool(kwargs.get("sha256") or kwargs.get("sha") or kwargs.get("want_sha"))
-        h = hashlib.sha256() if want_sha else None
-
-        if framing == "len":
-            try:
-                header = b""
-                while len(header) < 16:
-                    chunk = conn.recv(16 - len(header))
-                    if not chunk:
+                while True:
+                    try:
+                        chunk = conn.recv(65536)
+                    except socket.timeout:
+                        continue
+                    except Exception:
                         break
-                    header += _to_bytes(chunk)
-                if len(header) != 16 or not header.startswith(b"PWG4"):
-                    # unknown framing header
-                    try:
-                        conn.close()
-                    except Exception:
-                        pass
-                    try:
-                        srv.close()
-                    except Exception:
-                        pass
-                    return False
-                size = struct.unpack("!Q", header[4:12])[0]
-                flags = struct.unpack("!I", header[12:16])[0]
-                sha_in_stream = bool(flags & 1)
-                remaining = int(size)
-
-                while remaining > 0:
-                    chunk = conn.recv(min(65536, remaining))
                     if not chunk:
                         break
                     chunk = _to_bytes(chunk)
-                    fileobj.write(chunk)
-                    if h is not None:
-                        h.update(chunk)
-                    remaining -= len(chunk)
 
-                if remaining != 0:
-                    try:
-                        conn.close()
-                    except Exception:
-                        pass
-                    try:
-                        srv.close()
-                    except Exception:
-                        pass
-                    return False
+                    if not done:
+                        fileobj.write(chunk)
+                        continue
 
-                if sha_in_stream:
-                    digest = b""
-                    while len(digest) < 32:
-                        part = conn.recv(32 - len(digest))
-                        if not part:
-                            break
-                        digest += _to_bytes(part)
-                    if len(digest) != 32:
-                        try:
-                            conn.close()
-                        except Exception:
-                            pass
-                        try:
-                            srv.close()
-                        except Exception:
-                            pass
-                        return False
-                    if h is not None:
-                        if h.digest() != digest:
-                            try:
-                                conn.close()
-                            except Exception:
-                                pass
-                            try:
-                                srv.close()
-                            except Exception:
-                                pass
-                            return False
-                else:
-                    if want_sha:
-                        try:
-                            conn.close()
-                        except Exception:
-                            pass
-                        try:
-                            srv.close()
-                        except Exception:
-                            pass
-                        return False
+                    buf = tail + chunk
+                    if tlen and buf.endswith(tokb):
+                        if len(buf) > tlen:
+                            fileobj.write(buf[:-tlen])
+                        tail = b""
+                        break
 
-            except Exception:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-                try:
-                    srv.close()
-                except Exception:
-                    pass
-                return False
-        else:
-            # DONE token mode (unsafe for binary unless token unlikely) OR plain FIN
-            done = bool(kwargs.get("done"))
-            tok = kwargs.get("done_token") or "\nDONE\n"
-            tokb = _to_bytes(tok)
-            tlen = len(tokb)
-            tail = b""
-
-            while True:
-                try:
-                    chunk = conn.recv(65536)
-                except socket.timeout:
-                    continue
-                except Exception:
-                    break
-                if not chunk:
-                    break
-                chunk = _to_bytes(chunk)
-
-                if not done:
-                    fileobj.write(chunk)
-                    continue
-
-                buf = tail + chunk
-                if tlen and buf.endswith(tokb):
-                    if len(buf) > tlen:
+                    if tlen and len(buf) > tlen:
                         fileobj.write(buf[:-tlen])
-                    tail = b""
-                    break
+                        tail = buf[-tlen:]
+                    else:
+                        tail = buf
 
-                if tlen and len(buf) > tlen:
-                    fileobj.write(buf[:-tlen])
-                    tail = buf[-tlen:]
-                else:
-                    tail = buf
+                if done and tail:
+                    fileobj.write(tail)
 
-            if done and tail:
-                fileobj.write(tail)
+                ok = True
 
-        try:
-            conn.close()
-        except Exception:
-            pass
-        try:
-            srv.close()
-        except Exception:
-            pass
-        try:
-            fileobj.seek(0, 0)
-        except Exception:
-            pass
-        return True
+        finally:
+            try:
+                if conn is not None:
+                    conn.close()
+            except Exception:
+                pass
+            try:
+                srv.close()
+            except Exception:
+                pass
+
+        if ok:
+            try:
+                fileobj.seek(0, 0)
+            except Exception:
+                pass
+        return ok
 
     # UDP modes
     mode = (kwargs.get("mode") or "seq").lower()
@@ -3326,9 +3461,33 @@ def recv_to_fileobj(fileobj, host, port, proto="tcp", path_text=None, **kwargs):
 def send_from_fileobj(fileobj, host, port, proto="tcp", path_text=None, **kwargs):
     proto = (proto or "tcp").lower()
     port = int(port)
+    logger = _logger_from_kwargs(kwargs)
 
-    if proto == "tcp":
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    if proto == "tcp" or proto in _BT_SCHEMES:
+        is_bt = proto in _BT_SCHEMES
+        if is_bt:
+            if not _has_rfcomm():
+                _emit("Bluetooth RFCOMM is not available (missing AF_BLUETOOTH/BTPROTO_RFCOMM or PyBluez).",
+                      logger=logger, level=logging.ERROR, stream="stderr")
+                return False
+            sock = _bt_socket_stream()
+            if sock is None:
+                _emit("Failed to create Bluetooth RFCOMM socket.", logger=logger, level=logging.ERROR, stream="stderr")
+                return False
+            addr = _norm_bt_addr(host)
+            if not addr or addr == "00:00:00:00:00:00":
+                _emit("Bluetooth send requires a concrete remote bdaddr (not BDADDR_ANY).",
+                      logger=logger, level=logging.ERROR, stream="stderr")
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+                return False
+            connect_target = (addr, int(port))
+        else:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            connect_target = (host, int(port))
+
         try:
             to = kwargs.get("timeout", None)
             if to is not None and float(to) > 0:
@@ -3337,7 +3496,7 @@ def send_from_fileobj(fileobj, host, port, proto="tcp", path_text=None, **kwargs
             pass
 
         if "wait" not in kwargs and "connect_wait" not in kwargs:
-            # Default ON: behave like udp seq (wait for receiver)
+            # Default ON for stream: behave like udp seq (wait for receiver)
             kwargs["connect_wait"] = True
         wait = bool(kwargs.get("wait", False) or kwargs.get("connect_wait", False))
         wait_timeout = kwargs.get("wait_timeout", None)
@@ -3349,7 +3508,7 @@ def send_from_fileobj(fileobj, host, port, proto="tcp", path_text=None, **kwargs
         start_t = time.time()
         while True:
             try:
-                sock.connect((host, port))
+                sock.connect(connect_target)
                 break
             except Exception:
                 if not wait:
@@ -3365,8 +3524,8 @@ def send_from_fileobj(fileobj, host, port, proto="tcp", path_text=None, **kwargs
                         pass
                     return False
                 try:
-                    _net_log(kwargs.get("verbose"), "TCP: waiting for receiver (connect refused), retrying...", logger=logger)
-
+                    _net_log(kwargs.get("verbose"), f"{'BT' if is_bt else 'TCP'}: waiting for receiver, retrying...",
+                             logger=logger)
                     time.sleep(0.1)
                 except Exception:
                     pass
@@ -3497,7 +3656,6 @@ def send_from_fileobj(fileobj, host, port, proto="tcp", path_text=None, **kwargs
 
             if framing == "len" and want_sha:
                 sock.sendall(h.digest())
-
             elif kwargs.get("done"):
                 tok = kwargs.get("done_token") or "\nDONE\n"
                 sock.sendall(_to_bytes(tok))
@@ -5295,11 +5453,17 @@ def download_file_from_internet_file(url: str, **kwargs: Any):
     if p.scheme in ("file" or ""):
         return io.open(unquote(p.path), "rb")
 
-    if p.scheme in ("tcp", "udp"):
+    if p.scheme in ("tcp", "udp") or p.scheme in _BT_SCHEMES:
         parts, o = _parse_net_url(url)
-        host = o.get("bind") or parts.hostname or ""
-        port = parts.port or 0
         path_text = parts.path or "/"
+        if parts.scheme in _BT_SCHEMES:
+            qs = parse_qs(parts.query or "")
+            host, port = _bt_host_channel_from_url(parts, qs, o)
+            proto = "bt"
+        else:
+            host = o.get("bind") or parts.hostname or ""
+            port = parts.port or 0
+            proto = parts.scheme
 
         outfile = None
         dest_path = None
@@ -5328,7 +5492,7 @@ def download_file_from_internet_file(url: str, **kwargs: Any):
             outfile = MkTempFile()
 
         ok = recv_to_fileobj(
-            outfile, host=host, port=port, proto=p.scheme,
+            outfile, host=host, port=port, proto=proto,
             mode=o.get("mode"), timeout=o.get("timeout"), total_timeout=o.get("total_timeout"),
             window=o.get("window"), retries=o.get("retries"), chunk=o.get("chunk"),
             print_url=o.get("print_url"), resume_offset=resume_off, path_text=path_text, logger=kwargs.get("logger")
@@ -6006,45 +6170,73 @@ def _handle_upload(self):
 
 
 
-def upload_file_to_internet_file(fileobj, url):
+def upload_file_to_internet_file(fileobj, url: str, **kwargs: Any):
+    """Top-level dispatcher: uploads/sends a file object to the destination URL.
+
+    For stream URLs:
+      - tcp://host:port/...
+      - udp://host:port/...
+      - bt://BDADDR:channel/... (RFCOMM)
+
+    The caller typically provides a seekable file object.
+    """
     p = urlparse(url)
     if p.scheme in ("http", "https"):
         return _serve_file_over_http(fileobj, url, logger=kwargs.get("logger"))
     if p.scheme in ("ftp", "ftps"):
         return upload_file_to_ftp_file(fileobj, url)
-    if p.scheme in ("tftp", ):
+    if p.scheme in ("tftp",):
         return upload_file_to_tftp_file(fileobj, url)
     if p.scheme in ("sftp", "scp"):
         if __use_pysftp__ and havepysftp:
             return upload_file_to_pysftp_file(fileobj, url)
         return upload_file_to_sftp_file(fileobj, url)
-    if p.scheme in ("data", ):
+    if p.scheme in ("data",):
         return data_url_encode(fileobj)
     if p.scheme in ("file" or ""):
-        outfile = io.open(unquote(p.path), "wb")
         try:
             fileobj.seek(0, 0)
         except Exception:
             pass
+        _ensure_dir(os.path.dirname(unquote(p.path)) or ".")
         with io.open(unquote(p.path), "wb") as fdst:
             shutil.copyfileobj(fileobj, fdst)
+        try:
+            fileobj.seek(0, 0)
+        except Exception:
+            pass
         return fileobj
-    if p.scheme in ("tcp", "udp"):
+
+    if p.scheme in ("tcp", "udp") or p.scheme in _BT_SCHEMES:
         parts, o = _parse_net_url(url)
-        host = parts.hostname
-        port = parts.port or 0
         path_text = parts.path or "/"
+
+        if parts.scheme in _BT_SCHEMES:
+            qs = parse_qs(parts.query or "")
+            o2 = dict(o)
+            # For sending (client), never treat bind= as the remote host.
+            o2["bind"] = None
+            host, port = _bt_host_channel_from_url(parts, qs, o2)
+            proto = "bt"
+        else:
+            host = parts.hostname
+            port = parts.port or 0
+            proto = parts.scheme
+
         try:
             fileobj.seek(0, 0)
         except Exception:
             pass
         ok = send_from_fileobj(
-            fileobj, host=host, port=port, proto=p.scheme,
-            mode=o.get("mode"), timeout=o.get("timeout"), total_timeout=o.get("total_timeout"),
-            wait=o.get("wait"), connect_wait=o.get("connect_wait"), wait_timeout=(o.get("wait_timeout") if o.get("wait_timeout") is not None else (None if (p.scheme == "udp" and (o.get("mode") or "seq") == "raw") else o.get("timeout"))),
+            fileobj, host=host, port=port, proto=proto,
+            mode=o.get("mode"),
+            timeout=o.get("timeout"), total_timeout=o.get("total_timeout"),
+            wait=o.get("wait"), connect_wait=o.get("connect_wait"),
+            wait_timeout=(_resolve_wait_timeout(parts.scheme, o.get("mode"), o) if parts.scheme in ("udp", "tcp") else o.get("timeout")),
             window=o.get("window"), retries=o.get("retries"), chunk=o.get("chunk"),
             resume=o.get("resume"), path_text=path_text,
-            done=o.get("done"), done_token=o.get("done_token"), framing=o.get("framing"), sha256=o.get("sha256")
+            done=o.get("done"), done_token=o.get("done_token"), framing=o.get("framing"), sha256=o.get("sha256"),
+            logger=kwargs.get("logger"),
         )
         return fileobj if ok else False
 
