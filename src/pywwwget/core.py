@@ -5387,6 +5387,10 @@ def download_file_from_internet_file(url: str, **kwargs: Any):
     if p.scheme in ("tcp", "udp") or p.scheme in _BT_SCHEMES:
         parts, o = _parse_net_url(url)
         path_text = parts.path or "/"
+        if parts.scheme in _BT_SCHEMES and not o.get("framing"):
+            o["framing"] = "len"
+        if parts.scheme in _BT_SCHEMES and o.get("handshake") is None:
+            o["handshake"] = False
         if parts.scheme in _BT_SCHEMES:
             qs = parse_qs(parts.query or "")
             host, port = _bt_host_channel_from_url(parts, qs, o)
@@ -5426,7 +5430,7 @@ def download_file_from_internet_file(url: str, **kwargs: Any):
             outfile, host=host, port=port, proto=proto,
             mode=o.get("mode"), timeout=o.get("timeout"), total_timeout=o.get("total_timeout"),
             window=o.get("window"), retries=o.get("retries"), chunk=o.get("chunk"),
-            print_url=o.get("print_url"), resume_offset=resume_off, path_text=path_text, logger=kwargs.get("logger")
+            print_url=o.get("print_url"), resume_offset=resume_off, path_text=path_text, framing=o.get("framing"), handshake=o.get("handshake"), send_path=o.get("send_path"), logger=kwargs.get("logger")
         )
         if not ok:
             return False
@@ -6141,7 +6145,10 @@ def upload_file_to_internet_file(fileobj, url: str, **kwargs: Any):
     if p.scheme in ("tcp", "udp") or p.scheme in _BT_SCHEMES:
         parts, o = _parse_net_url(url)
         path_text = parts.path or "/"
-
+        if parts.scheme in _BT_SCHEMES and not o.get("framing"):
+            o["framing"] = "len"
+        if parts.scheme in _BT_SCHEMES and o.get("handshake") is None:
+            o["handshake"] = False
         if parts.scheme in _BT_SCHEMES:
             qs = parse_qs(parts.query or "")
             o2 = dict(o)
@@ -6149,6 +6156,10 @@ def upload_file_to_internet_file(fileobj, url: str, **kwargs: Any):
             o2["bind"] = None
             host, port = _bt_host_channel_from_url(parts, qs, o2)
             proto = "bt"
+            # bt:// historically used raw streaming; do not send PATH preface unless requested.
+            send_path = _qflag(qs, "send_path", False) or bool(o.get("send_path"))
+            if not send_path:
+                path_text = None
         else:
             host = parts.hostname
             port = parts.port or 0
